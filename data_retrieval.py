@@ -71,6 +71,17 @@ class DataRetrieval:
         data = response.json()
         self.sector = data['Sector']
         self.industry = data['Industry']
+        
+        ## Sector etfs
+        sector_etfs = {
+            "Technology": "XLK",
+            "Financials": "XLF",
+            "Healthcare": "XLV",
+            "Energy": "XLE",
+            "Consumer Discretionary": "XLY",
+            "Consumer Staples": "XLP"
+        }
+        etf_symbol = sec
 
         # Retriving inductory and sector data 
         return self.sector, self.industry

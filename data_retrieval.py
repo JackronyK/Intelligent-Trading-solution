@@ -1,176 +1,188 @@
-import pandas as pd
-from  config import settings
+import random
 import requests
-import yfinance as yf
+import pandas as pd
 import logging
+import yfinance as yf
+from config import settings
+
+logging.basicConfig(level=logging.INFO)
+
 class DataRetrieval:
     """
-    A class to handle data retrieval for stock analysis, including historicl prices, dividends, earnings, and secto / Indurty data 
+    A class to handle data retrieval for stock analysis, including historical prices, dividends, earnings, and sector/industry data.
     """
-    def __init__(self, ticker):
+
+    def __init__(self, ticker: str):
         """
-        Initializes the DataRetrieval class with the given stock ticker.
+        Initializes the DataRetrieval class with the given stock ticker, API keys, and proxy list.
 
         Args:
             ticker (str): The stock ticker symbol.
-
         """
         self.ticker = ticker.strip()
-        self.apikey = settings.alpha_api_key
-        
-    def historical_prices(self):
+        self.api_keys = settings.alpha_api_keys
+        self.proxy_url = settings.proxy_url
+        self.base_url = "https://www.alphavantage.co/query"
+        self.timeout = 10
+
+        # Fetch and clean proxies
+        proxy_list_raw = requests.get(self.proxy_url).text.split('\n')
+        self.proxies = [
+            {"http": f"http://{prx}", "https": f"http://{prx}"}
+            for prx in proxy_list_raw if prx.strip()
+        ]
+        if not self.api_keys:
+            raise ValueError("No API keys found in settings.")
+        if not self.proxies:
+            raise ValueError("No proxies retrieved from the proxy URL.")
+
+    def _make_request(self, params: dict) -> dict:
         """
-       Retrieves historical daily stock prices using Alpha Vantage API.
+        Attempt to make a request without a proxy first. If it fails due to rate limits, use proxies.
+
+        Args:
+            params (dict): Query parameters for the API.
+
+        Returns:
+            dict: The API response.
+
+        Raises:
+            RuntimeError: If all attempts fail.
+        """
+        # First, try without a proxy
+        for api_key in self.api_keys:
+            params["apikey"] = api_key
+            logging.info("Attempting direct request without proxy...")
+            try:
+                response = requests.get(url=self.base_url, params=params, timeout=self.timeout)
+                response.raise_for_status()
+                if response.status_code == 429:
+                    logging.warning("Rate limit hit. Switching to proxy.")
+                else:
+                    return response.json()
+            except requests.exceptions.RequestException as e:
+                logging.warning(f"Direct request failed: {e}")
+                continue
+
+        # Try using proxies
+        for attempt in range(len(self.api_keys) * len(self.proxies)):
+            params["apikey"] = random.choice(self.api_keys)
+            proxy = random.choice(self.proxies)
+            logging.info(f"Attempt {attempt + 1}: Using proxy {proxy} and API key.")
+            try:
+                response = requests.get(
+                    url=self.base_url,
+                    params=params,
+                    proxies=proxy,
+                    timeout=self.timeout
+                )
+                response.raise_for_status()
+                return response.json()
+            except requests.exceptions.ProxyError as e:
+                logging.warning(f"ProxyError: {e}. Retrying with another proxy...")
+            except requests.exceptions.SSLError as e:
+                logging.warning(f"SSLError: {e}. Skipping this proxy...")
+            except requests.exceptions.ReadTimeout:
+                logging.warning(f"ReadTimeout: Proxy {proxy} timed out. Retrying...")
+            except requests.exceptions.RequestException as e:
+                logging.warning(f"General error with proxy: {e}. Retrying...")
+
+        raise RuntimeError("All attempts to make the request failed. Check API keys and proxies.")
+
+    def historical_prices(self) -> pd.DataFrame:
+        """
+        Retrieve historical daily stock prices using Alpha Vantage API.
 
         Returns:
             pd.DataFrame: A DataFrame containing historical prices with open, high, low, close, and volume.
         """
-        # initializing the API
-        url = "https://www.alphavantage.co/query"
         params = {
             "function": "TIME_SERIES_DAILY",
             "symbol": self.ticker,
-            "apikey": self.apikey,
-            "outputsize": "full"
+            "outputsize": "full",
         }
-        response = requests.get(url=url, params=params)
 
-        # Error handling  for api response
-        if response.status_code !=200:
-            raise Exception(f"Error: Unable to fetch historical prices. Status Code: {response.status_code}")        
-         
-        data = response.json()
+        data = self._make_request(params)
 
-        # Handling case when API limit is exceeded or invalid response
         if "Time Series (Daily)" not in data:
-            raise KeyError(f"Error: Time Series (Daily) data not found in response. Check your API limits or ticker")        
-        
-        hist_data = data['Time Series (Daily)']
+            raise KeyError(f"'Time Series (Daily)' data not found for {self.ticker}. Check your API limits.")
 
-        # Creating DataFrame and formatting columns
-        hist_df = pd.DataFrame.from_dict(hist_data, orient='index', dtype=float)
-        new_cols = {col: col[3:].title() for col in hist_df.columns}
-        hist_df.rename(columns=new_cols, inplace=True)   
+        hist_data = data["Time Series (Daily)"]
+        hist_df = pd.DataFrame.from_dict(hist_data, orient="index", dtype=float)
+
+        # Rename columns
+        new_cols = {col: col.split(" ")[1].capitalize() for col in hist_df.columns}
+        hist_df.rename(columns=new_cols, inplace=True)
+
+        # Format index
         hist_df.index = pd.to_datetime(hist_df.index)
         hist_df.index.name = "Date"
 
         return hist_df
-    
-    def dividends_history(self):
+
+    def dividends(self) -> pd.DataFrame:
         """
-        Retrieves dividend payment history using the yFinance library.
+        Retrieve dividend data for the stock using Yahoo Finance.
 
         Returns:
-            pd.Series: A Series containing dividend payments indexed by date.
+            pd.DataFrame: A DataFrame containing dividend payout history.
         """
         try:
-            # Use yFinance library for dividends (Alpha Vantage API does not explicitly return dividends)
-            ticker_dataset = yf.Ticker(self.ticker)
-            div_hist = ticker_dataset.dividends
-            #index formatting
-            div_hist.index = pd.to_datetime(div_hist.index)
-            div_hist.name = "Date"
+            logging.info(f"Fetching dividend data for {self.ticker} from Yahoo Finance...")
+            stock = yf.Ticker(self.ticker)
+            dividends = stock.dividends
 
-            # Check if the data is empty
-            if div_hist.empty:
-                print(f"Warning: No dividend data found for {self.ticker}. The company may not pay dividends.")
-                return pd.Series(dtype=float)  # Return an empty Series if no data is found
+            if dividends.empty:
+                logging.warning(f"No dividend data found for {self.ticker}.")
+                return pd.DataFrame(columns=["Date", "Dividend Amount"])
 
-            return div_hist
+            # Convert to DataFrame
+            dividend_df = dividends.reset_index()
+            dividend_df.columns = ["Date", "Dividend Amount"]
+            return dividend_df
 
         except Exception as e:
-        # Handle any unexpected errors gracefully
-            print(f"Error retrieving dividend history for {self.ticker}: {e}")
-            return pd.Series(dtype=float)  # Return an empty Series in case of failure
+            logging.error(f"Failed to fetch dividend data for {self.ticker}: {e}")
+            return pd.DataFrame(columns=["Date", "Dividend Amount"])
 
-    def earnings(self):
+    def earnings(self) -> pd.DataFrame:
         """
-        Retrieves quarterly and annual earnings data using Alpha Vantage API.
+        Retrieve earnings data for the stock.
 
         Returns:
-            tuple: Two DataFrames containing quarterly and annual earnings, respectively.
+            pd.DataFrame: A DataFrame containing quarterly or annual earnings data.
         """
-        url = "https://www.alphavantage.co/query"
         params = {
             "function": "EARNINGS",
             "symbol": self.ticker,
-            "apikey": self.apikey,
-            "outputsize": "full"
         }
-        response = requests.get(url=url, params=params)
 
-        # Error handling for API response
-        if response.status_code !=200:
-            raise Exception(f"Error: Unable to fetch earnings data. Status Code: {response.status_code}")
-        
-        raw_data = response.json()
+        data = self._make_request(params)
 
-        # Handle cases where earnings data is missing
-        if 'quarterlyEarnings' not in raw_data or 'annualEarnings' not in raw_data:
-            raise KeyError(f"Error: Earnings data not found for {self.ticker}. Check API limits or ticker.")
-        
-        # parse quarterly and annual earnings 
-        quarterly_Earnings = pd.DataFrame(raw_data['quarterlyEarnings'])
-        annual_Earnings = pd.DataFrame(raw_data['annualEarnings']).set_index("fiscalDateEnding").astype(float)
-        return quarterly_Earnings, annual_Earnings
-        
-    def sector_industry_data(self):
+        if "quarterlyEarnings" not in data:
+            raise KeyError(f"'quarterlyEarnings' data not found for {self.ticker}. Check your API limits.")
+
+        return pd.DataFrame(data["quarterlyEarnings"])
+
+    def sector_and_industry(self) -> dict:
         """
-        Fetches sector, industry, and company name for the given ticker.
-        
+        Retrieve sector and industry data for the stock.
+
         Returns:
-            pd.DataFrame: A DataFrame with the following columns:
-                - Company Name
-                - Sector
-                - Industry
-        
-        Raises:
-            ValueError: If the ticker or API key is invalid.
-            requests.exceptions.RequestException: For HTTP-related errors.
-            KeyError: If expected keys are missing from the response.
+            dict: A dictionary containing sector and industry information.
         """
-        url = "https://www.alphavantage.co/query"
         params = {
             "function": "OVERVIEW",
             "symbol": self.ticker,
-            "apikey": self.apikey
         }
 
-        try:
-            response = requests.get(url=url, params=params)
-            response.raise_for_status()  # Raise error for bad HTTP responses
-            
-            data = response.json()
-            
-            # Extract relevant details with default values
-            company_name = data.get('Name', 'N/A')
-            sector = data.get('Sector', 'N/A')
-            industry = data.get('Industry', 'N/A')
+        data = self._make_request(params)
 
-            # Logging fetched data for debugging
-            logging.info(f"Fetched data for ticker {self.ticker}: {data}")
+        if not data:
+            raise KeyError(f"Sector and industry data not found for {self.ticker}. Check your API limits.")
 
-            # Creating a DataFrame
-            details = pd.DataFrame({
-                "Company Name": [company_name],
-                "Sector": [sector],
-                "Industry": [industry]
-            })
-
-            return details
-
-        except requests.exceptions.RequestException as http_err:
-            logging.error(f"HTTP error occurred: {http_err}")
-            raise
-        except KeyError as key_err:
-            logging.error(f"Missing data in the response: {key_err}")
-            raise
-        except Exception as e:
-            logging.error(f"Unexpected error: {e}")
-            raise Exception(f"Error fetching sector/industry data for ticker '{self.ticker}': {e}")
-
-
-
-
-
-        
+        return {
+            "Sector": data.get("Sector"),
+            "Industry": data.get("Industry"),
+            "Company Name": data.get("Name")
+        }

@@ -4,6 +4,9 @@ import warnings
 from statsmodels.tsa.seasonal import seasonal_decompose
 from statsmodels.stats.diagnostic import het_arch, acorr_ljungbox
 from statsmodels.tsa.stattools import adfuller, kpss, acf, pacf
+from arch import arch_model
+from  statsmodels.tsa.arima.model import ARIMA
+from statsmodels.tsa.statespace.sarimax import SARIMAX
 from data_retrieval import DataRetrieval
 
 class TimeSeriesPreprocessor:
@@ -22,7 +25,7 @@ class TimeSeriesPreprocessor:
         self.stock = DataRetrieval(ticker=ticker)
         self.data_attributes = {}
 
-    def _compute_returns(self):
+    def compute_returns(self):
         """
         Retrieves historical prices, calculates normal and log returns.
         """
@@ -60,7 +63,7 @@ class TimeSeriesPreprocessor:
             "ARCHOrder": 0
         }
 
-        self._compute_returns()
+        self.compute_returns()
         log_returns = self.returns['Log_Returns']
 
         ## --- STATIONARITY TESTS ---
@@ -149,3 +152,77 @@ class TimeSeriesPreprocessor:
                 self.models_feat["params"]["EGARCH"] = {"p": 1, "q": 1}
 
         return self.models_feat
+    
+class modelling:
+    def __init__(self, ticker):
+        self.prossesor = TimeSeriesPreprocessor(ticker=ticker)
+        self.prossesor.compute_returns()
+        self.returns_df = self.returns
+
+    def model_fitting(self):
+        self.model_res = {
+            "name": None,
+            "init_trained_model":None,
+            "tuned_model": None
+        }
+        self.prossesor.model_selector()
+        if "ARCH" in self.model_feat['name']:
+            p = self.models_feat["params"]["ARCH"]['p']
+            model = arch_model(self.returns_df, vol='ARCH', p=p)
+            model.fit(disp=False)
+
+            # Appending result to the res dict
+            self.model_res['name'] = 'arch'
+            self.model_res['init_trained_model'] = model
+        elif "GARCH" in self.model_feat['name']:
+            p = self.models_feat["params"]["GARCH"]['p']
+            q = self.models_feat["params"]["GARCH"]['q']
+            model = arch_model(self.returns_df, vol='GARCH', p=p, q=q)
+            model.fit()
+
+            # Appending result to the res dict
+            self.model_res['name'] = 'garch'
+            self.model_res['init_trained_model'] = model
+        elif "EGARCH" in self.model_feat['name']:
+            p = self.models_feat["params"]["EGARCH"]['p']
+            q = self.models_feat["params"]["EGARCH"]['q']
+            model = arch_model(self.returns_df, vol='EGARCH', p=p, q=q)
+            model.fit()
+
+            # Appending result to the res dict
+            self.model_res['name'] = 'egarch'
+            self.model_res['init_trained_model'] = model
+        elif "ARIMA" in self.model_feat['name']:
+            order = self.models_feat["params"]["ARIMA"]['order']
+            model = ARIMA(self.returns_df, order=order)
+            model.fit()
+
+            # Appending result to the res dict
+            self.model_res['name'] = 'arima'
+            self.model_res['init_trained_model'] = model
+        elif "SARIMA" in self.model_feat['name']:
+            order = self.models_feat["params"]["SARIMA"]['order']
+            seasonal_order = self.models_feat["params"]["SARIMA"]['seasonal_order']
+
+            model = SARIMAX(self.returns_df, order=order, seasonal_order=seasonal_order)
+            model.fit()
+
+            # Appending result to the res dict
+            self.model_res['name'] = 'sarima'
+            self.model_res['init_trained_model'] = model
+        return self.model_res
+
+        
+    def tuning_params(self):
+        model_res = self.model_fitting()
+        
+
+
+
+
+
+
+
+
+
+    

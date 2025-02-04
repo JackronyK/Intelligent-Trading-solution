@@ -213,8 +213,21 @@ class modelling:
         return self.model_res
 
         
+    def _arch_tuner(self, model_res):
+        best_aic = float('inf')    
+        for p in range(1, 5):
+            try:
+                model = arch_model(self.returns_df, vol='ARCH', p=p)
+                res = model.fit(disp=False)
+                if res.aic < best_aic:
+                    best_aic = res.aic
+                    best_model = 
+
+
+
     def tuning_params(self):
         model_res = self.model_fitting()
+        
         
 
 

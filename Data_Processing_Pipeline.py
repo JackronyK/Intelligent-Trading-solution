@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 import warnings
+import logging
 from statsmodels.tsa.seasonal import seasonal_decompose
 from statsmodels.stats.diagnostic import het_arch, acorr_ljungbox
 from statsmodels.tsa.stattools import adfuller, kpss, acf, pacf
@@ -8,6 +9,7 @@ from arch import arch_model
 from  statsmodels.tsa.arima.model import ARIMA
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 from data_retrieval import DataRetrieval
+from typing import Dict, Any, Optional
 
 class TimeSeriesPreprocessor:
     """
@@ -153,6 +155,230 @@ class TimeSeriesPreprocessor:
 
         return self.models_feat
     
+#Configure logging 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class VolatilityModeler:
+    """
+    Autonomous end-to-end volatility modeling pipeline that:
+    1. Automatically selects models based on TS attributes
+    2. Tunes parameters using grid search
+    3. Selects best model by AIC/BIC
+    4. Stores forecasts and metrics
+    """
+    def __init__(self, ticker: str):
+        """
+        Initialize the modeler with a ticker symbol.
+        
+        Args:
+            ticker (str): The ticker symbol for the stock.
+        """
+        self.ticker = ticker
+        self.processor = TimeSeriesPreprocessor(ticker=ticker)
+        self._validate_initialization()
+
+        # Auto-detect model candidates
+        self.suggested_models = self.processor.model_selector()['name']
+        self.default_param_grids = {
+            'ARCH': {'p': [1, 2, 3]},
+            'GARCH': {'p': [1, 2], 'q': [1, 2]},
+            'EGARCH': {'p': [1, 2], 'q': [1], 'o': [1]},
+            'ARIMA': {'order': [(1,0,1), (1,1,1)]},
+            'SARIMA': {'order': [(1,1,1)], 'seasonal_order': [(0,1,1,12)]}
+
+        }
+
+        # Result storage
+        self.trained_models = {}
+        self.best_model = None
+        self.forecast = {}
+
+        """        # State tracking
+        self.is_trained = False
+        self.models: Dict[str, any] = {
+            'initial_model': None,
+            'tuned_model': None,
+            'best_params': None,
+            'Metrics': {}
+        } 
+        """
+    
+    def _validate_initialization(self):
+        """ Ensure prerequisite data exists and is valid"""
+        try:
+            self.processor.compute_returns()
+            self.returns_df = self.processor.returns
+            if self.returns_df.empty:
+                raise ValueError("Empty returns dataframe")
+        except AttributeError as e:
+            logger.error(f"Initialization failed: {str(e)}")
+            raise
+    
+    def _auto_fit_tune(self):
+        """
+        Core automation pipeline
+        """
+        for model_type in  self.suggested_models:
+            try:
+                # Fit base model
+                base_model = self._fit_base_model(model_type)
+                if not base_model:
+                    continue
+
+                # Tune parameters
+                tuned_model = self._tune_model(
+                    model_type,
+                    self.default_param_grids.get(model_type, {})
+                )
+
+                # Store results
+                self.trained_models[model_type] = {
+                    'base': base_model,
+                    'tuned': tuned_model,
+                    'metrics': {
+                        'aic': tuned_model.aic,
+                        'bic': tuned_model.bic
+                    }
+                }
+            except Exception as e:
+                logger.warning(f"Failed processing {model_type}: {str(e)}")
+                continue
+            # Select best model
+        self._select_best_model()
+
+    def _fit_base_model(self, model_type: str):
+        """
+        initial model fitting with error handling
+        """
+        try:
+            config = self._get_model_config(model_type)
+            model = config['constructor'](self.returns_df, **config['params'])
+            return model.fit(disp=False)
+        except Exception as e:
+            logger.error(f"Failed fitting {model_type}: {str(e)}")
+            return None
+    def _tune_model(self, model_type: str, param_grid: dict):
+        """ Automated parameter tuning"""
+        best_aic = float('inf')
+        best_model = None
+
+        for params in self._param_generator(param_grid):
+            try:
+                model = self._get_model_config(model_type)['constructor'](self.returns_df, **params)
+                fitted = model.fit(disp=False)
+
+                if fitted.aic < best_aic:
+                    best_aic = fitted.aic
+                    best_model = fitted
+            except:
+                continue
+        return best_model
+    
+    def _select_best_model(self):
+        """ select the best model by AIC"""
+        if not self.trained_models:
+            raise ValueError("No Models trained successfully")
+        
+        self.best_model = min(
+            self.trained_models.items(),
+            key=lambda x: x[1]['metrics']['aic']
+        )
+        logger.info(f"Selected best model: {self.best_model[0]}")
+
+    def run_pipeline(self, forecast_horizon: int = 5):
+        """Execute full autonomous pipeline"""
+        self._auto_fit_tune()
+
+        # Generate forecast
+        if self.best_model:
+            forecast = self.best_model[1]['tuned'].forecast(horizon=forecast_horizon)
+            self.forecasts = {
+                'mean': forecast.mean,
+                'variance': forecast.variance,
+                'interval': forecast.conf_int()
+            }
+        return {
+            'best_model': self.best_model[0],
+            'parameters': self.best_model[1]['tuned'].params,
+            'forecast': self.forecasts,
+            'all_models': self.trained_models
+        }   
+
+
+    def _get_model_config(self, model_type: str) -> Dict:
+        """
+        Centralized model configuration for supported models.
+        
+        Args:
+            model_type (str): The type of model (e.g., 'ARCH', 'GARCH', 'EGARCH', 'ARIMA', 'SARIMA').
+        
+        Returns:
+            Dict: Configuration for the specified model type.
+        """
+        configs = {
+            'ARCH': {
+                'constructor': arch_model,
+                'params': {
+                    'vol': "ARCH",
+                    'p': self.processor.models_feat['params']['ARCH']['p']
+                }},
+            'GARCH': {
+                'constructor': arch_model,
+                'params': {
+                    'vol': "GARCH",
+                    'p': self.processor.models_feat['params']['GARCH']['p'],
+                    'q': self.processor.models_feat['params']['GARCH']['q']
+                }
+            },
+            'EGARCH': {
+                'constructor': arch_model,
+                'params': {
+                    'vol': "EGARCH",
+                    'p': self.processor.models_feat['params']['EGARCH']['p'],
+                    'q': self.processor.models_feat['params']['EGARCH']['q']
+                }
+            },           
+            'ARIMA': {
+                'constructor': ARIMA,
+                'params': {
+                    'order': self.processor.models_feat['params']['ARIMA']['order']
+                }
+            },
+            'SARIMA': {
+                'constructor': SARIMAX,
+                'params': {
+                    'order': self.processor.models_feat['params']['SARIMA']['order'],
+                    'seasonal_order': self.processor.models_feat['params']['SARIMA']['seasonal_order']
+                }
+            }
+        }
+        return configs.get(model_type, {})
+    # Helper methods
+    @staticmethod
+
+    def _param_generator(grid: Dict):
+        """
+        Generate parameter combinations for grid search.
+        
+        Args:
+            grid (Dict): A dictionary of parameter ranges.
+        
+        Yields:
+            Dict: A dictionary of parameter combinations.
+        """
+        from itertools import product
+        keys, values = zip(*grid.items())
+        for v in product(*values):
+            yield dict(zip(keys, v))
+
+    def __repr__(self):
+        return f"<VolatilityModeler(ticker={self.ticker}, trained={self.is_trained})>"
+
+        
+
+
+
 class modelling:
     def __init__(self, ticker):
         self.prossesor = TimeSeriesPreprocessor(ticker=ticker)
@@ -216,17 +442,117 @@ class modelling:
     def _arch_tuner(self, model_res):
         best_aic = float('inf')    
         for p in range(1, 5):
-            try:
+           # try:
                 model = arch_model(self.returns_df, vol='ARCH', p=p)
                 res = model.fit(disp=False)
                 if res.aic < best_aic:
                     best_aic = res.aic
-                    best_model = 
+                    #best_model = 
 
 
 
     def tuning_params(self):
         model_res = self.model_fitting()
+
+
+    def fit_model(self, model_type: str) -> Optional[Dict]:
+        """
+        Fit the specified model type to the returns data.
+        
+        Args:
+            model_type (str): The type of model to fit.
+        
+        Returns:
+            Optional[Dict]: A dictionary containing the fitted model and metrics, or None if fitting fails.
+        """
+        try:
+            config = self._get_model_config(model_type)
+            if not config:
+                raise ValueError(f"Unsupported model type: {model_type}")
+            model = config['constructor'](self.returns_df, **config['params'])
+            fitted_model = model.fit(disp=False)
+
+            self.models.update(
+                {
+                    'initial_model': fitted_model,
+                    'model_type': model_type,
+                    'metrics': {
+                        'aic': fitted_model.aic,
+                        'bic': fitted_model.bic
+                    }
+                }
+            )
+            self.is_trained = True
+            return self.models
+
+        except Exception as e:
+            logger.error(f"Failed fitting {model_type}: {str(e)}")
+            self.is_trained = False
+            return None
+
+    def tune_model(self, param_grid: Dict[str, Any], metric: str = 'aic')->Dict:
+        """
+        Tune the model using grid search over the specified parameter grid.
+        
+        Args:
+            param_grid (Dict[str, Any]): A dictionary of parameters to search over.
+            metric (str): The metric to optimize ('aic' or 'bic').
+        
+        Returns:
+            Dict: A dictionary containing the best model, parameters, and metrics.
+        """
+        if not self.is_trained:
+            raise RuntimeError("Fit initial model before tuning")
+        best_metric = float('inf')
+        best_params = {}
+
+        for params in self._param_generator(param_grid):
+            try:
+                current_model = self.models['initial_model'].model.clone(self.returns_df, **params)
+                results = current_model.fit(disp=False)
+
+                if results.info_criteria[metric] < best_metric:
+                    best_metric = results.info_criteria['metric']
+                    best_params = params
+                    self.models['tuned_model'] = results
+            except Exception as e:
+                logger.warning(f"Skipping params {params}: {str(e)}")
+                continue
+
+        self.models.update({
+            'best_params': best_params,
+            'metric': {
+                metric: best_metric,
+                'best_model': self.models['tuned_model'].summary()
+            }
+        })
+        
+        return self.models
+    
+    def forecast(self, horizon: int=5) -> Dict:
+        """
+        Generate forecasts using the tuned model.
+        
+        Args:
+            horizon (int): The number of periods to forecast.
+        
+        Returns:
+            Dict: A dictionary containing the forecasted values and confidence intervals.
+        """
+        if not self.models['tuned_model']:
+            raise RuntimeError("No tuned model available for forecasting")
+        
+        try:
+            forecast = self.models['tuned_model'].forecast(horizon=horizon)
+
+            return {
+                'ticker': self.ticker,
+                'forecast': forecast.mean.values,
+                'confidence_intervals': forecast.conf_int().values
+            }
+        except Exception as e:
+            logger.error(f"Forecast failed: {str(e)}")
+            return {'error': str(e)}
         
         
 
